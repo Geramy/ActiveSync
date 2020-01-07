@@ -1,4 +1,20 @@
 <?php
+include_once ('../ox/lib/OXConnector.php');
+include_once ('../ox/lib/OXUtils.php');
+include_once ('../ox/lib/TimezoneConverter/fake.php');
+include_once ('../ox/lib/TimezoneConverter/DateTime.php');
+include_once ('../ox/lib/TimezoneConverter/Exception.php');
+include_once ('../ox/lib/TimezoneConverter/TimezoneNotFoundException.php');
+include_once ('../ox/lib/TimezoneConverter/TimezoneConverter.php');
+include_once ('../ox/mail/emails.php');
+include_once ('../ox/contacts/contacts.php');
+include_once ('../ox/calendar/calendar.php');
+include_once ('../ox/lib/default/diffbackend/diffbackend.php');
+include_once ('../ox/include/mimeDecode.php');
+require_once ('../ox/include/z_RFC822.php');
+require_once ('../ox/lib/utils/timezoneutil.php');
+require_once ('../ox/HTTP/Request2.php');
+
 /**
  * Horde_ActiveSync_Driver_Base::
  *
@@ -7,26 +23,17 @@
  *            Version 2, the distribution of the Horde_ActiveSync module in or
  *            to the United States of America is excluded from the scope of this
  *            license.
- * @copyright 2010-2017 Horde LLC (http://www.horde.org)
- * @author    Michael J Rubinsky <mrubinsk@horde.org>
- * @package   ActiveSync
+ * @copyright 2018-2020 JQluv.net, Inc.
+ * @author    Geramy L Loveless <geramy.loveless@jqluvhost.net>
+ * @package   OX ActiveSync
  */
 /**
  * Base ActiveSync Driver backend. Provides communication with the actual
  * server backend that ActiveSync will be syncing devices with. This is an
  * class, servers must implement their own backend to provide
  * the needed data.
- *
- * @license   http://www.horde.org/licenses/gpl GPLv2
- *            NOTE: According to sec. 8 of the GENERAL PUBLIC LICENSE (GPL),
- *            Version 2, the distribution of the Horde_ActiveSync module in or
- *            to the United States of America is excluded from the scope of this
- *            license.
- * @copyright 2010-2017 Horde LLC (http://www.horde.org)
- * @author    Michael J Rubinsky <mrubinsk@horde.org>
- * @package   ActiveSync
  */
-class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
+class Horde_ActiveSync_Driver_OXDriver extends Horde_ActiveSync_Driver_Base
 {
     /**
      *  Server folder ids for non-email folders.
@@ -37,11 +44,11 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
     const CONTACTS_FOLDER_UID     = '@Contacts@';
     const TASKS_FOLDER_UID        = '@Tasks@';
     const NOTES_FOLDER_UID        = '@Notes@';
-    const SPECIAL_SENT   = 'sent';
-    const SPECIAL_SPAM   = 'spam';
-    const SPECIAL_TRASH  = 'trash';
-    const SPECIAL_DRAFTS = 'drafts';
-    const SPECIAL_INBOX  = 'inbox';
+    const SPECIAL_SENT   = 'default0/Sent Items';
+    const SPECIAL_SPAM   = 'default0/Spam';
+    const SPECIAL_TRASH  = 'default0/Trash';
+    const SPECIAL_DRAFTS = 'default0/Drafts';
+    const SPECIAL_INBOX  = 'default0/INBOX';
 
     protected $_auth;
     protected $_connector;
@@ -53,12 +60,56 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
         self::NOTES_FOLDER_UID        => 'Notes',
     );
 
+    private $session = false;
+    private $cookiejar = true;
+    private $root_folder = array();
+    private $OXConnector;
+    private $OXUtils;
+    private $EmailSync;
+    private $ContactSync;
+    private $CalendarSync;
+    private $TZconverter;
+
     public function __construct($params = array())
     {
         parent::__construct($params);
         $this->_connector = $params['connector'];
         //$this->_auth = $params['auth'];
         $this->_imap = $params['imap'];
+        $this -> OXConnector = new OXConnector();
+        $this -> OXUtils = new OXUtils();
+    }
+
+        /**
+     * Any code needed to authenticate to backend as the actual user.
+     *
+     * @param string $username  The username to authenticate as
+     * @param string $password  The password
+     * @param string $domain    The user domain (unused in this driver).
+     *
+     * @return mixed  Boolean true on success, boolean false on credential
+     *                failure or Horde_ActiveSync::AUTH_REASON_*
+     *                constant on policy failure.
+     */
+    public function authenticate($username, $password, $domain = null)
+    {
+        //Implemented OXDriver Version - Done!
+        $this->_authUser = $username;
+        $this->_authPass = $password;
+        $response = $this -> OXConnector -> OXreqPOST('/ajax/login?action=login', array('name' => $username, 'password' => $password, ));
+        if ($response) {
+            if (array_key_exists("session", $response)) {
+                $this -> OXConnector -> setSession($response["session"]);
+                $this->_logger->log(LOGLEVEL_DEBUG, "OXDriver::authenticate() - Login successfully, get SessionID: " . $this -> session);
+
+                $this -> EmailSync = new OXEmailSync($this -> OXConnector, $this -> OXUtils);
+                $this -> ContactSync = new OXContactSync($this -> OXConnector, $this -> OXUtils);
+                $this -> CalendarSync = new OXCalendarSync($this -> OXConnector, $this -> OXUtils);
+
+                return true;
+            }
+        }
+        return true;
     }
 
     /**
@@ -97,6 +148,383 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
     public function moveMessage($folderid, array $ids, $newfolderid)
     {
         return $ids;
+    }
+
+    /**
+     * Returns array of items which contain contact information
+     *
+     * @param string $type   The search type; ['gal'|'mailbox']
+     * @param array $query   The search query. An array containing:
+     *  - query: (string) The search term.
+     *           DEFAULT: none, REQUIRED
+     *  - range: (string)   A range limiter.
+     *           DEFAULT: none (No range used).
+     *
+     * @return array  An array containing:
+     *  - rows:   An array of search results
+     *  - status: The search store status code.
+     */
+    public function getSearchResults($type, array $query)
+    {
+        return array();
+    }
+
+    /**
+     * Stat folder. Note that since the only thing that can ever change for a
+     * folder is the name, we use that as the 'mod' value.
+     *
+     * @param string $id     The folder id
+     * @param mixed $parent  The parent folder (or 0 if none).
+     * @param mixed $mod     Modification indicator. For folders, this is the
+     *                       name of the folder, since that's the only thing
+     *                       that can change.
+     * @return a stat hash
+     */
+    public function statFolder($id, $parent = 0, $mod = null)
+    {
+        //Implemented OXDriver Version - Done!
+        $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::StatFolder(' . $id . ')');
+        $folder = $this ->getFolder($id);
+    
+        $stat = array();
+        $stat["id"] = $id;
+        $stat["parent"] = $folder->parentid;
+        $stat["mod"] = $folder->displayname;
+        $stat["serverid"] = $id;
+        return $stat;
+    }
+
+    /**
+     * Return the ActiveSync message object for the specified folder.
+     *
+     * @param string $id  The folder's server id.
+     *
+     * @return Horde_ActiveSync_Message_Folder object.
+     */
+    public function getFolder($id)
+    {
+        //Implemented OXDriver Version - Done!
+        $this->_logger->log(LOGLEVEL_DEBUG, "OXDriver::getFolder() - SessionID: " . $this -> session);
+        // Get the list of calendar and contact folders:
+        /*	Name of the module which implements this folder; e.g. "tasks", "calendar", "contacts", "infostore", or "mail"*/
+        $response = $this -> OXConnector -> OXreqGET('/ajax/folders', array('action' => 'get', 'session' => $this -> OXConnector -> getSession(), 'id' => $id,
+        //http://oxpedia.org/wiki/index.php?title=HTTP_API#CommonFolderData
+        'columns' => '1,20,300,301,316', //objectID�| parentfolderID | title | module/type
+        ));
+        if ($response) {
+
+            $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::getFolder(' . $id . ') title: ' . $response["data"]["title"] . ' module: ' . $response["data"]["module"]);
+            $serverid = $id;
+            if (array_key_exists($response["data"]["folder_id"], $this -> root_folder) || $response["data"]["folder_id"] == "default0") {
+                $parentid = "0";
+            } else {
+                $parentid = $response["data"]["folder_id"];
+            }
+            $displayname = $response["data"]["title"];
+            switch ($response["data"]["module"]) {
+                case "contacts" :
+                    $type = Horde_ActiveSync::FOLDER_TYPE_CONTACT;
+                    break;
+                case "calendar" :
+                    $type = Horde_ActiveSync::FOLDER_TYPE_APPOINTMENT;
+                    break;
+                case "mail" :
+                    $this->_logger->log(LOGLEVEL_DEBUG, "Mail folder: " . $id . " FolderType : " . $response["data"]["standard_folder_type"]);
+                    switch ( $response["data"]["standard_folder_type"] ) {
+                        case "7" :
+                            $type = Horde_ActiveSync::FOLDER_TYPE_INBOX;
+                            break;
+                        case "9" :
+                            $type = Horde_ActiveSync::FOLDER_TYPE_DRAFTS;
+                            break;
+                        case "10" :
+                            $type = Horde_ActiveSync::FOLDER_TYPE_SENTMAIL;
+                            break;
+                        case "12" :
+                            $type = Horde_ActiveSync::FOLDER_TYPE_WASTEBASKETT;
+                            break;
+                        default :
+                            $type = Horde_ActiveSync::FOLDER_TYPE_USER_MAIL;
+                            break;
+                    }
+                    break;
+                default:
+                    return false;
+                    break;
+            }
+            return $folder = $this->_buildNonMailFolder($serverid, $parentid, $type, $displayname);
+        }
+        return false;
+        //throw new Horde_ActiveSync_Exception('Folder ' . $id . ' unknown');
+    }
+
+    protected function _getFolderUidForBackendId($sid, $type = null, $old_id = null)
+    {
+        switch ($sid) {
+        case 'INBOX':
+            return '519422f1-4c5c-4547-946a-1701c0a8015f';
+        default:
+            return $sid;
+        }
+    }
+
+    /**
+     * Helper to build a folder object for non-email folders.
+     *
+     * @param string $id      The folder's server id.
+     * @param stirng $parent  The folder's parent id.
+     * @param integer $type   The folder type.
+     * @param string $name    The folder description.
+     *
+     * @return  Horde_ActiveSync_Message_Folder  The folder object.
+     */
+    protected function _buildNonMailFolder($id, $parent, $type, $name)
+    {
+        //Implemented OXDriver Version - Done!
+        $folder = new Horde_ActiveSync_Message_Folder();
+        $folder->serverid = $id;
+        $folder->parentid = $parent;
+        $folder->type = $type;
+        $folder->displayname = $name;
+
+        return $folder;
+    }
+
+    /**
+     * Get the list of folder stat arrays @see self::statFolder()
+     *
+     * @return array  An array of folder stat arrays.
+     */
+    public function getFolderList()
+    {
+        //Implemented OXDriver Version - Done!
+        $folderlist = $this->getFolders();
+        $folders = array();
+        foreach ($folderlist as $f) {
+            $folders[] = $this->statFolder($f->serverid, $f->parentid);
+        }
+
+        return $folders;
+    }
+
+    /**
+     * Return an array of the server's folder objects.
+     *
+     * @return array  An array of Horde_ActiveSync_Message_Folder objects.
+     */
+    public function getFolders()
+    {
+        //Implemented OXDriver Version - Done!
+        $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::GetFolderList() - start: ');
+        if (empty($this->_folders)) {
+            try {
+                $supported = $this->_connector->listApis();
+            } catch (Exception $e) {
+                return array();
+            }
+            $folder_list = array();
+            /* We need to build Horde Message Folders for all the results. */
+            //$this->_folders = $folders;
+            //$folder = $this->_buildNonMailFolder($serverid, $parentid, $type, $displayname); //1,20,300,301,316
+            if (array_search('calendar', $supported) !== false) {
+                $type = "calendar";
+                $response = $this -> OXConnector -> OXreqGET('/ajax/folders', array('action' => 'root', 'session' => $this -> OXConnector -> getSession(), 'allowed_modules' => $type,
+                //http://oxpedia.org/wiki/index.php?title=HTTP_API#CommonFolderData
+                'columns' => '1', ));
+                if ($response) {
+                    foreach ($response["data"] as &$root_folder) {
+                        $root_folder = $root_folder[0];
+                        $this -> root_folder[] = $root_folder;
+                        $folderlist = $this -> GetSubFolders($root_folder, $type);
+                        foreach ($folderlist as &$folderid) {
+                            $folder = $this -> statFolder($folderid);
+                            # custom folders for non email folders is only supported by eas >= 12
+                            # all folders with parent == 1 are the default folders
+                            if (Request::GetProtocolVersion() >= 12.0 or $folder['parent'] == 1){
+                                $folder_list[] = $folder;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (array_search('contacts', $supported) !== false) {
+                $type = "contacts";
+                $response = $this -> OXConnector -> OXreqGET('/ajax/folders', array('action' => 'root', 'session' => $this -> OXConnector -> getSession(), 'allowed_modules' => $type,
+                //http://oxpedia.org/wiki/index.php?title=HTTP_API#CommonFolderData
+                'columns' => '1', ));
+                if ($response) {
+                    foreach ($response["data"] as &$root_folder) {
+                        $root_folder = $root_folder[0];
+                        $this -> root_folder[] = $root_folder;
+                        $folderlist = $this -> GetSubFolders($root_folder, $type);
+                        foreach ($folderlist as &$folderid) {
+                            $folder = $this -> statFolder($folderid);
+                            # custom folders for non email folders is only supported by eas >= 12
+                            # all folders with parent == 1 are the default folders
+                            if (Request::GetProtocolVersion() >= 12.0 or $folder['parent'] == 1){
+                                $folder_list[] = $folder;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (array_search('tasks', $supported) !== false) {
+                $type = "tasks";
+                $response = $this -> OXConnector -> OXreqGET('/ajax/folders', array('action' => 'root', 'session' => $this -> OXConnector -> getSession(), 'allowed_modules' => $type,
+                //http://oxpedia.org/wiki/index.php?title=HTTP_API#CommonFolderData
+                'columns' => '1', ));
+                if ($response) {
+                    foreach ($response["data"] as &$root_folder) {
+                        $root_folder = $root_folder[0];
+                        $this -> root_folder[] = $root_folder;
+                        $folderlist = $this -> GetSubFolders($root_folder, $type);
+                        foreach ($folderlist as &$folderid) {
+                            $folder = $this -> statFolder($folderid);
+                            # custom folders for non email folders is only supported by eas >= 12
+                            # all folders with parent == 1 are the default folders
+                            if (Request::GetProtocolVersion() >= 12.0 or $folder['parent'] == 1){
+                                $folder_list[] = $folder;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (array_search('notes', $supported) !== false) {
+                /* I dont know if OX Supports Notes? */
+               // $folders[] = $this->getFolder(self::NOTES_FOLDER_UID);
+            }
+
+            if (array_search('mail', $supported) !== false) {
+
+                $response = $this -> OXConnector -> OXreqGET('/ajax/folders', array('action' => 'list', 'parent' => 'default0', // personal email folder ?
+                'session' => $this -> OXConnector -> getSession(), 'allowed_modules' => 'mail',
+                //http://oxpedia.org/wiki/index.php?title=HTTP_API#CommonFolderData
+                'columns' => '1', ));
+            
+                $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::GetFolderList() - mailrepsonse: ' . print_r($response, true));
+            
+                if ($response) {
+                    foreach ($response["data"] as &$root_folder) {
+                        $root_folder = $root_folder[0];
+                        $this->_logger->log(LOGLEVEL_DEBUG, "root_folder: " . $root_folder);
+                        $this -> root_folder[] = $root_folder;
+                        $folderlist = $this -> GetSubFolders($root_folder);
+                        $folder_list[] = $this -> statFolder($root_folder);
+                        foreach ($folderlist as &$folderid) {
+                            if (!is_numeric($folderid)) {
+                                $folder_list[] = $this -> statFolder($folderid);
+                                $this->_logger->log(LOGLEVEL_DEBUG, "folder: " . $folderid);
+                            }
+                        }
+                    }
+                }
+                else {
+                    return array();
+                }
+            }
+            $this->_folders = $folder_list;
+        }
+        $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::GetFolderList() - folder_list: ' . print_r($folder_list, true));
+        return $this->_folders;
+    }
+
+    private function GetSubFolders($id, $type) {
+        //Implemented OXDriver Version - Done!
+        $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::GetSubFolders(' . $id . ')');
+        $lst = array();
+        $response = $this -> OXConnector -> OXreqGET('/ajax/folders', array('action' => 'list', 'session' => $this -> OXConnector -> getSession(),
+        'parent' => $id, 'columns' => '1,301', "allowed_modules" => $type ));
+
+        $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::GetSubFolder(' . $id . ') - response: ' . print_r($response, true));
+
+        foreach ($response["data"] as &$folder) {
+            // restrict to contacts | calendar | mail
+            if (in_array($folder[1], array($type))) {
+                $lst[] = $folder[0];
+                $subfolders = $this -> GetSubFolders($folder[0], $type);
+                foreach ($subfolders as &$subfolder) {
+                    $lst[] = $subfolder;
+                }
+            }
+        }
+
+        $this->_logger->log(LOGLEVEL_DEBUG, 'OXDriver::GetSubFolder() - lst: ' . print_r($lst, true));
+
+        return $lst;
+    }
+
+    /**
+     * Get a list of server changes that occured during the specified time
+     * period.
+     *
+     * @param string $folderId     The server id of the collection to check.
+     * @param integer $from_ts     The starting timestamp.
+     * @param integer $to_ts       The ending timestamp.
+     * @param integer $cutoffdate  The earliest date to retrieve back to.
+     * @param boolean $ping        If true, returned changeset may
+     *                             not contain the full changeset, may only
+     *                             contain a single change, designed only to
+     *                             indicate *some* change has taken place. The
+     *                             value should not be used to determine *what*
+     *                             change has taken place.
+     *
+     * @return array A list of messge uids that have chnaged in the specified
+     *               time period.
+     */
+    public function getServerChanges($folderId, $from_ts, $to_ts, $cutoffdate, $ping)
+    {
+
+        $changes = array(
+            'add' => array(),
+            'delete' => array(),
+            'modify' => array()
+        );
+        if ($from_ts == 0 && !$ignoreFirstSync) {
+            $startstamp = (int)$cutoffdate;
+            $endstamp = time() + 32140800; //60 * 60 * 24 * 31 * 12 == one year
+            $changes['add'] = $this->_connector->listUids($startstamp, $endstamp);
+        } else {
+            $changes = $this->_connector->getChanges($folderId, $from_ts, $to_ts);
+        }
+
+        $results = array();
+        foreach ($changes['add'] as $add) {
+            $results[] = array(
+                'id' => $add,
+                'type' => Horde_ActiveSync::CHANGE_TYPE_CHANGE,
+                'flags' => Horde_ActiveSync::FLAG_NEWMESSAGE);
+        }
+
+        // For CLASS_EMAIL, all changes are a change in flags.
+        if ($folder->collectionClass() == Horde_ActiveSync::CLASS_EMAIL) {
+            $flags = $folder->flags();
+            foreach ($changes['modify'] as $uid) {
+                $results[] = array(
+                    'id' => $uid,
+                    'type' => Horde_ActiveSync::CHANGE_TYPE_FLAGS,
+                    'flags' => $flags[$uid]
+                );
+            }
+        } else {
+            foreach ($changes['modify'] as $change) {
+                $results[] = array(
+                    'id' => $change,
+                    'type' => Horde_ActiveSync::CHANGE_TYPE_CHANGE
+                );
+            }
+        }
+
+        // Server Deletions
+        foreach ($changes['delete'] as $deleted) {
+            $results[] = array(
+                'id' => $deleted,
+                'type' => Horde_ActiveSync::CHANGE_TYPE_DELETE);
+        }
+
+        return $results;
     }
 
     /**
@@ -299,9 +727,7 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
      */
     protected function _doQuery(array $query)
     {
-        $imap_query = new Horde_Imap_Client_Search_Query();
-        $imap_query->charset('UTF-8', false);
-        $mboxes = array();
+        $serverid = NULL;
         $results = array();
         foreach ($query as $q) {
             switch ($q['op']) {
@@ -316,7 +742,7 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
                         }
                         break;
                     case 'serverid':
-                        $mboxes[] = new Horde_Imap_Client_Mailbox($value);
+                        $serverid = $value
                         break;
                     case Horde_ActiveSync_Message_Mail::POOMMAIL_DATERECEIVED:
                         if ($q['op'] == Horde_ActiveSync_Request_Search::SEARCH_GREATERTHAN) {
@@ -371,353 +797,6 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
     }
 
     /**
-     * Stat folder. Note that since the only thing that can ever change for a
-     * folder is the name, we use that as the 'mod' value.
-     *
-     * @param string $id     The folder id
-     * @param mixed $parent  The parent folder (or 0 if none).
-     * @param mixed $mod     Modification indicator. For folders, this is the
-     *                       name of the folder, since that's the only thing
-     *                       that can change.
-     * @return a stat hash
-     */
-    public function statFolder($id, $parent = 0, $mod = null)
-    {
-        $folder = array();
-        $folder['id'] = $id;
-        $folder['mod'] = empty($mod) ? $id : $mod;
-        $folder['parent'] = $parent;
-        $folder['serverid'] = !empty($serverid) ? $serverid : $id;
-
-        return $folder;
-    }
-
-    /**
-     * Return the ActiveSync message object for the specified folder.
-     *
-     * @param string $id  The folder's server id.
-     *
-     * @return Horde_ActiveSync_Message_Folder object.
-     */
-    public function getFolder($id)
-    {
-        switch ($id) {
-        case self::APPOINTMENTS_FOLDER_UID:
-            $folder = $this->_buildNonMailFolder(
-                $id,
-                0,
-                Horde_ActiveSync::FOLDER_TYPE_APPOINTMENT,
-                $this->_displayMap[self::APPOINTMENTS_FOLDER_UID]);
-            break;
-        case self::CONTACTS_FOLDER_UID:
-            $folder = $this->_buildNonMailFolder(
-               $id,
-               0,
-               Horde_ActiveSync::FOLDER_TYPE_CONTACT,
-               $this->_displayMap[self::CONTACTS_FOLDER_UID]);
-            break;
-        case self::TASKS_FOLDER_UID:
-            $folder = $this->_buildNonMailFolder(
-                $id,
-                0,
-                Horde_ActiveSync::FOLDER_TYPE_TASK,
-                $this->_displayMap[self::TASKS_FOLDER_UID]);
-            break;
-        case self::NOTES_FOLDER_UID:
-            $folder = $this->_buildNonMailFolder(
-                $id,
-                0,
-                Horde_ActiveSync::FOLDER_TYPE_NOTE,
-                $this->_displayMap[self::NOTES_FOLDER_UID]);
-                break;
-        default:
-            // Must be a mail folder
-            $folders = $this->_getMailFolders();
-            foreach ($folders as $folder) {
-                if ($folder->_serverid == $id) {
-                    return $folder;
-                }
-            }
-            throw new Horde_ActiveSync_Exception('Folder ' . $id . ' unknown');
-        }
-
-        return $folder;
-    }
-
-   /**
-     * Return the list of mail server folders.
-     *
-     * @return array  An array of Horde_ActiveSync_Message_Folder objects.
-     */
-    protected function _getMailFolders()
-    {
-        if (empty($this->_imap)) {
-            $this->_mailFolders = array($this->_buildDummyFolder(self::SPECIAL_INBOX));
-            $this->_mailFolders[] = $this->_buildDummyFolder(self::SPECIAL_TRASH);
-            $this->_mailFolders[] = $this->_buildDummyFolder(self::SPECIAL_SENT);
-        } else {
-            $folders = array();
-            $imap_folders = $this->_imap->getMailboxes();
-
-            // Build the folder tree, making sure the lower levels are
-            // added first.
-            $level = 0;
-            $cnt = 0;
-            while ($cnt < count($imap_folders)) {
-                foreach ($imap_folders as $id => $folder) {
-                    if ($folder['level'] == $level) {
-                        try {
-                            $folders[] = $this->_getMailFolder($id, $imap_folders, $folder);
-                            ++$cnt;
-                        } catch (Horde_ActiveSync_Exception $e) {
-                            $this->_logger->err(sprintf('Problem retrieving %s mail folder', $id));
-                        }
-                    }
-                }
-                ++$level;
-            }
-
-            $this->_mailFolders = $folders;
-        }
-    }
-
-    protected function _getFolderUidForBackendId($sid, $type = null, $old_id = null)
-    {
-        switch ($sid) {
-        case 'INBOX':
-            return '519422f1-4c5c-4547-946a-1701c0a8015f';
-        default:
-            return $sid;
-        }
-    }
-
-    protected function _getMailFolder($sid, array $fl, array $f)
-    {
-        $folder = new Horde_ActiveSync_Message_Folder();
-        $folder->_serverid = $sid;
-        $folder->serverid = $this->_getFolderUidForBackendId($sid);
-        $folder->parentid = '0';
-        $folder->displayname = $f['label'];
-
-        // Check for nested folders. $fl will NEVER contain containers so we
-        // can assume that any entry in $fl is an actual mailbox. EAS does
-        // not support containers so we only do this if the parent is an
-        // actual mailbox.
-        if ($f['level'] != 0) {
-            $parts = explode($f['d'], $sid);
-            $displayname = array_pop($parts);
-            if (!empty($fl[implode($f['d'], $parts)])) {
-                $folder->parentid = $this->_getFolderUidForBackendId(implode($f['d'], $parts));
-                $folder->_parentid = implode($f['d'], $parts);
-                $folder->displayname = $displayname;
-            }
-        }
-
-        if (strcasecmp($sid, 'INBOX') === 0) {
-            $folder->type = Horde_ActiveSync::FOLDER_TYPE_INBOX;
-            return $folder;
-        }
-
-        try {
-            $specialFolders = $this->_imap->getSpecialMailboxes();
-        } catch (Horde_ActiveSync_Exception $e) {
-            $this->_logger->err(sprintf(
-                'Problem retrieving special folders: %s',
-                $e->getMessage())
-            );
-            throw $e;
-        }
-
-        // Check for known, supported special folders.
-        foreach ($specialFolders as $key => $value) {
-            if (!is_array($value)) {
-                $value = array($value);
-            }
-            foreach ($value as $mailbox) {
-                if (!is_null($mailbox)) {
-                    switch ($key) {
-                    case self::SPECIAL_SENT:
-                        if ($sid == $mailbox->value) {
-                            $folder->type = Horde_ActiveSync::FOLDER_TYPE_SENTMAIL;
-                            return $folder;
-                        }
-                        break;
-                    case self::SPECIAL_TRASH:
-                        if ($sid == $mailbox->value) {
-                            $folder->type = Horde_ActiveSync::FOLDER_TYPE_WASTEBASKET;
-                            return $folder;
-                        }
-                        break;
-
-                    case self::SPECIAL_DRAFTS:
-                        if ($sid == $mailbox->value) {
-                            $folder->type = Horde_ActiveSync::FOLDER_TYPE_DRAFTS;
-                            return $folder;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Not a known folder, set it to user mail.
-        $folder->type = Horde_ActiveSync::FOLDER_TYPE_USER_MAIL;
-
-        return $folder;
-    }
-
-    /**
-     * Helper to build a folder object for non-email folders.
-     *
-     * @param string $id      The folder's server id.
-     * @param stirng $parent  The folder's parent id.
-     * @param integer $type   The folder type.
-     * @param string $name    The folder description.
-     *
-     * @return  Horde_ActiveSync_Message_Folder  The folder object.
-     */
-    protected function _buildNonMailFolder($id, $parent, $type, $name)
-    {
-        $folder = new Horde_ActiveSync_Message_Folder();
-        $folder->serverid = $id;
-        $folder->parentid = $parent;
-        $folder->type = $type;
-        $folder->displayname = $name;
-
-        return $folder;
-    }
-
-    /**
-     * Get the list of folder stat arrays @see self::statFolder()
-     *
-     * @return array  An array of folder stat arrays.
-     */
-    public function getFolderList()
-    {
-        $folderlist = $this->getFolders();
-        $folders = array();
-        foreach ($folderlist as $f) {
-            $folders[] = $this->statFolder($f->serverid, $f->parentid, $f->displayname, $f->_serverid);
-        }
-
-        return $folders;
-    }
-
-    /**
-     * Return an array of the server's folder objects.
-     *
-     * @return array  An array of Horde_ActiveSync_Message_Folder objects.
-     */
-    public function getFolders()
-    {
-        if (empty($this->_folders)) {
-            try {
-                $supported = $this->_connector->listApis();
-            } catch (Exception $e) {
-                return array();
-            }
-            $folders = array();
-            if (array_search('calendar', $supported) !== false) {
-                $folders[] = $this->getFolder(self::APPOINTMENTS_FOLDER_UID);
-            }
-
-            if (array_search('contacts', $supported) !== false) {
-                $folders[] = $this->getFolder(self::CONTACTS_FOLDER_UID);
-            }
-
-            if (array_search('tasks', $supported) !== false) {
-                $folders[] = $this->getFolder(self::TASKS_FOLDER_UID);
-            }
-
-            if (array_search('notes', $supported) !== false) {
-                $folders[] = $this->getFolder(self::NOTES_FOLDER_UID);
-            }
-
-            if (array_search('mail', $supported) !== false) {
-                try {
-                    $folders = array_merge($folders, $this->_getMailFolders());
-                } catch (Horde_ActiveSync_Exception $e) {
-                    return array();
-                }
-            }
-            $this->_folders = $folders;
-        }
-
-        return $this->_folders;
-    }
-
-    /**
-     * Get a list of server changes that occured during the specified time
-     * period.
-     *
-     * @param string $folderId     The server id of the collection to check.
-     * @param integer $from_ts     The starting timestamp.
-     * @param integer $to_ts       The ending timestamp.
-     * @param integer $cutoffdate  The earliest date to retrieve back to.
-     * @param boolean $ping        If true, returned changeset may
-     *                             not contain the full changeset, may only
-     *                             contain a single change, designed only to
-     *                             indicate *some* change has taken place. The
-     *                             value should not be used to determine *what*
-     *                             change has taken place.
-     *
-     * @return array A list of messge uids that have chnaged in the specified
-     *               time period.
-     */
-    public function getServerChanges($folderId, $from_ts, $to_ts, $cutoffdate, $ping)
-    {
-
-        $changes = array(
-            'add' => array(),
-            'delete' => array(),
-            'modify' => array()
-        );
-        if ($from_ts == 0 && !$ignoreFirstSync) {
-            $startstamp = (int)$cutoffdate;
-            $endstamp = time() + 32140800; //60 * 60 * 24 * 31 * 12 == one year
-            $changes['add'] = $this->_connector->listUids($startstamp, $endstamp);
-        } else {
-            $changes = $this->_connector->getChanges($folderId, $from_ts, $to_ts);
-        }
-
-        $results = array();
-        foreach ($changes['add'] as $add) {
-            $results[] = array(
-                'id' => $add,
-                'type' => Horde_ActiveSync::CHANGE_TYPE_CHANGE,
-                'flags' => Horde_ActiveSync::FLAG_NEWMESSAGE);
-        }
-
-        // For CLASS_EMAIL, all changes are a change in flags.
-        if ($folder->collectionClass() == Horde_ActiveSync::CLASS_EMAIL) {
-            $flags = $folder->flags();
-            foreach ($changes['modify'] as $uid) {
-                $results[] = array(
-                    'id' => $uid,
-                    'type' => Horde_ActiveSync::CHANGE_TYPE_FLAGS,
-                    'flags' => $flags[$uid]
-                );
-            }
-        } else {
-            foreach ($changes['modify'] as $change) {
-                $results[] = array(
-                    'id' => $change,
-                    'type' => Horde_ActiveSync::CHANGE_TYPE_CHANGE
-                );
-            }
-        }
-
-        // Server Deletions
-        foreach ($changes['delete'] as $deleted) {
-            $results[] = array(
-                'id' => $deleted,
-                'type' => Horde_ActiveSync::CHANGE_TYPE_DELETE);
-        }
-
-        return $results;
-    }
-
-    /**
      * Get a message stat.
      *
      * @param string $folderId  The folder id
@@ -753,6 +832,7 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
      */
     public function getMessage($folderid, $id, array $collection)
     {
+        //Implemented OXDriver Version - Done!
         return $this->_connector->export($id, array());
     }
 
@@ -949,9 +1029,9 @@ class Horde_ActiveSync_Driver_Mock extends Horde_ActiveSync_Driver_Base
      *
      * @param string $email  The email address
      *
-     * @return string  The username to use to authenticate to Horde with.
+     * @return string  The username to use to authenticate to OX with.
      */
-    public function getUsernameFromEmail($email) {  }
+    public function getUsernameFromEmail($email) { return $email; }
 
     /**
      * Handle ResolveRecipient requests
